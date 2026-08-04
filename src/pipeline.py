@@ -1,5 +1,8 @@
 import json
+import os
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, List
@@ -37,12 +40,14 @@ class SubtitlePipeline:
         self.options.output_dir.mkdir(parents=True, exist_ok=True)
         self.state = StateStore(self.options.output_dir / "任务状态.json")
         self.errors = []
+        self._error_lock = threading.Lock()
 
     def _error(self, record: VideoRecord, stage: str, exc: Exception) -> None:
         record.status = "failed"
         record.error = f"{stage}：{exc}"
         self.state.put(record)
-        self.errors.append({"video_id": record.video_id, "title": record.title, "stage": stage, "error": str(exc)})
+        with self._error_lock:
+            self.errors.append({"video_id": record.video_id, "title": record.title, "stage": stage, "error": str(exc)})
         self.log(f"失败 [{stage}] {record.title}：{exc}")
 
     def _write_report(self, excel_paths: List[Path]) -> None:
@@ -118,48 +123,89 @@ class SubtitlePipeline:
         unique = {record.video_id: record for record in discovered}
         records = list(unique.values())
         self.log(f"待处理视频：{len(records)} 条。")
-        self.log("阶段 2/4：批量下载全部视频音频")
+        self.log(f"阶段 2/4：并发提取音频（{self.options.audio_workers} 路）")
+        audio_jobs = []
         for number, record in enumerate(records, 1):
             if record.status == "done" and record.transcript:
-                self.log(f"[{number}/{len(records)}] 已完成，跳过下载：{record.title}")
+                self.log(f"[{number}/{len(records)}] 已完成，跳过音频：{record.title}")
                 continue
+            audio_path = Path(record.audio_path) if record.audio_path else None
+            if audio_path and audio_path.exists():
+                record.status = "audio_downloaded"
+                record.error = ""
+                self.state.put(record)
+                continue
+            audio_jobs.append((number, record))
+
+        def prepare_audio(number: int, record: VideoRecord) -> None:
             try:
-                audio_path = Path(record.audio_path) if record.audio_path else None
-                if not audio_path or not audio_path.exists():
-                    self.log(f"[{number}/{len(records)}] 下载：{record.title}")
-                    audio_path = extract_audio(record, self.options, self.log)
-                    record.audio_path = str(audio_path)
+                self.log(f"[{number}/{len(records)}] 提取音频：{record.title}")
+                audio_path = extract_audio(record, self.options, self.log)
+                record.audio_path = str(audio_path)
                 record.status = "audio_downloaded"
                 record.error = ""
                 self.state.put(record)
             except Exception as exc:
-                self._error(record, "下载音频", exc)
+                self._error(record, "提取音频", exc)
+
+        if audio_jobs:
+            with ThreadPoolExecutor(max_workers=self.options.audio_workers, thread_name_prefix="audio") as pool:
+                futures = [pool.submit(prepare_audio, number, record) for number, record in audio_jobs]
+                for future in as_completed(futures):
+                    future.result()
 
         self.log("阶段 3/4：从已下载音频中提取口播字幕")
-        transcriber = None
         transcribe_records = [
             record for record in records
             if record.status != "done" and record.audio_path and Path(record.audio_path).exists()
         ]
-        for number, record in enumerate(transcribe_records, 1):
+        if transcribe_records:
+            cpu_threads = self.options.cpu_threads
+            if self.options.transcription_workers > 1 and not cpu_threads:
+                cpu_threads = max(1, (os.cpu_count() or 2) // self.options.transcription_workers)
+            self.log(
+                f"正在加载 Whisper {self.options.model} 模型（转写并发 {self.options.transcription_workers} 路，"
+                f"搜索宽度 {self.options.beam_size}）…"
+            )
+            transcriber = Transcriber(
+                self.options.model,
+                self.options.language,
+                self.options.beam_size,
+                self.options.transcription_workers,
+                cpu_threads,
+            )
+
+        def transcribe_record(number: int, record: VideoRecord) -> None:
             audio_path = Path(record.audio_path)
             try:
                 self.log(f"[{number}/{len(transcribe_records)}] 转写：{record.title}")
-                if transcriber is None:
-                    self.log(f"正在加载 Whisper {self.options.model} 模型（首次使用可能需要下载）…")
-                    transcriber = Transcriber(
-                        self.options.model, self.options.language, self.options.use_gpu, self.log
-                    )
                 record.transcript = transcriber.transcribe(audio_path)
                 record.status = "done"
                 record.error = ""
                 self.state.put(record)
-                if not self.options.keep_audio and audio_path.exists():
-                    audio_path.unlink()
-                    record.audio_path = ""
-                    self.state.put(record)
             except Exception as exc:
                 self._error(record, "转写", exc)
+            finally:
+                if audio_path.exists():
+                    try:
+                        audio_path.unlink()
+                    except OSError as exc:
+                        self.log(f"未能清理音频：{audio_path.name}（{exc}）")
+                    else:
+                        record.audio_path = ""
+                        self.state.put(record)
+
+        if transcribe_records:
+            self.log(f"阶段 3/4：并发转写口播字幕（{self.options.transcription_workers} 路）")
+            with ThreadPoolExecutor(
+                max_workers=self.options.transcription_workers, thread_name_prefix="transcribe"
+            ) as pool:
+                futures = [
+                    pool.submit(transcribe_record, number, record)
+                    for number, record in enumerate(transcribe_records, 1)
+                ]
+                for future in as_completed(futures):
+                    future.result()
 
         self.log("阶段 4/4：生成 Excel")
         excel_paths = export_excel(self.state.values(), self.options.output_dir / "excel")

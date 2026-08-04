@@ -1,30 +1,30 @@
 from pathlib import Path
-from typing import Callable, Optional
-
-
-Log = Callable[[str], None]
+from typing import Optional
 
 
 class Transcriber:
-    def __init__(self, model_name: str, language: Optional[str], use_gpu: bool, log: Log):
+    def __init__(
+        self,
+        model_name: str,
+        language: Optional[str],
+        beam_size: int,
+        workers: int,
+        cpu_threads: int,
+    ):
         from faster_whisper import WhisperModel
         from opencc import OpenCC
 
         self.language = language or None
         self.converter = OpenCC("t2s") if self.language == "zh" else None
-        device = "cuda" if use_gpu else "cpu"
-        compute_type = "float16" if use_gpu else "int8"
-        try:
-            self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        except Exception as exc:
-            if not use_gpu:
-                raise
-            log(f"GPU 初始化失败，已回退至 CPU：{exc}")
-            self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        self.beam_size = beam_size
+        settings = {"device": "cpu", "compute_type": "int8", "num_workers": workers}
+        if cpu_threads:
+            settings["cpu_threads"] = cpu_threads
+        self.model = WhisperModel(model_name, **settings)
 
     def transcribe(self, audio_path: Path) -> str:
         segments, _info = self.model.transcribe(
-            str(audio_path), language=self.language, vad_filter=True, beam_size=5
+            str(audio_path), language=self.language, vad_filter=True, beam_size=self.beam_size
         )
         text = "".join(segment.text.strip() for segment in segments).strip()
         if not text:

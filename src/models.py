@@ -31,9 +31,10 @@ class RunOptions:
     output_dir: Path
     model: str = "small"
     language: Optional[str] = "zh"
-    workers: int = 1
+    audio_workers: int = 3
+    transcription_workers: int = 1
+    beam_size: int = 3
+    cpu_threads: int = 0
     cookies_file: Optional[Path] = None
     cookies_from_browser: Optional[str] = None
-    use_gpu: bool = False
-    keep_audio: bool = True
     cleanup_source_videos: bool = True
